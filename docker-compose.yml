@@ -1,0 +1,167 @@
+name: payments-api
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: payments-postgres
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: payments-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Single-node KRaft: no ZooKeeper.
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: payments-kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: payments-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic payments.events \
+          --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    container_name: payments-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://payments:payments@postgres:5432/payments?sslmode=disable"
+      - "up"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payments-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: debug
+      HTTP_ADDR: ":8080"
+      POSTGRES_DSN: postgres://payments:payments@postgres:5432/payments?sslmode=disable
+      REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: payments.events
+      KAFKA_ENABLED: "true"
+      KAFKA_CONSUMER_GROUP: payments-audit
+      API_KEYS: dev-key:local-dev
+      RATE_LIMIT_REQUESTS: "240"
+      RATE_LIMIT_WINDOW: 1m
+      CARD_PROVIDER: stripe
+      STRIPE_API_KEY: ${STRIPE_API_KEY:-sk_test_replace_me}
+      PIX_PROVIDER: static
+      STATIC_PIX_KEY: dev-pix-key@example.com
+      STATIC_PIX_MERCHANT_NAME: PAYMENTS API STORE
+      STATIC_PIX_MERCHANT_CITY: SAO PAULO
+      ALLOW_PIX_SIMULATION: "true"
+      IDEMPOTENCY_TTL: 24h
+      IDEMPOTENCY_LOCK_TTL: 45s
+      DASHBOARD_CACHE_TTL: 60s
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  events-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payments-events-consumer
+    entrypoint: ["/app/events-consumer"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: info
+      POSTGRES_DSN: postgres://payments:payments@postgres:5432/payments?sslmode=disable
+      REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: payments.events
+      KAFKA_ENABLED: "true"
+      KAFKA_CONSUMER_GROUP: payments-audit
+      API_KEYS: dev-key:local-dev
+      CARD_PROVIDER: stripe
+      STRIPE_API_KEY: ${STRIPE_API_KEY:-sk_test_replace_me}
+      PIX_PROVIDER: static
+
+volumes:
+  pgdata:
+  redisdata:
+  kafkadata:
